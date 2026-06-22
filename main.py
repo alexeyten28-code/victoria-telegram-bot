@@ -33,14 +33,27 @@ def send_to_dify(text, user_id):
         "Authorization": f"Bearer {DIFY_KEY}",
         "Content-Type": "application/json"
     }
+    # Очищаем URL от возможных случайных пробелов
+    base_url = DIFY_URL.strip()
+    
     data = {
         "inputs": {},
         "query": text,
         "response_mode": "blocking",
         "user": f"tg_{user_id}"
     }
-    response = requests.post(f"{DIFY_URL}/chat-messages", json=data, headers=headers)
-    response.raise_for_status()
+    
+    endpoint = f"{base_url}/chat-messages"
+    print(f"Отправка запроса на: {endpoint}")
+    
+    response = requests.post(endpoint, json=data, headers=headers)
+    
+    # Если Dify ответил ошибкой, выводим её подробное описание в логи Render
+    if response.status_code != 200:
+        print(f"Ошибка Dify API. Код ответа: {response.status_code}")
+        print(f"Тело ответа от Dify: {response.text}")
+        response.raise_for_status()
+        
     return response.json().get("answer", "Извини, не удалось получить ответ от Виктории.")
 
 @bot.message_handler(commands=['start'])
@@ -54,7 +67,11 @@ def handle_text(message):
         answer = send_to_dify(message.text, message.from_user.id)
         bot.reply_to(message, answer)
     except Exception as e:
-        bot.reply_to(message, f"Произошла ошибка: {e}")
+        # Пытаемся вытащить подробности ошибки из исключения HTTPError
+        error_msg = f"Произошла ошибка: {e}"
+        if hasattr(e, 'response') and e.response is not None:
+            error_msg += f"\nДетали от Dify: {e.response.text}"
+        bot.reply_to(message, error_msg)
 
 @bot.message_handler(content_types=['voice'])
 def handle_voice(message):
@@ -67,21 +84,33 @@ def handle_voice(message):
         file_data = requests.get(file_url).content
         
         headers = {"Authorization": f"Bearer {DIFY_KEY}"}
+        base_url = DIFY_URL.strip()
         files = {'file': ('voice.ogg', file_data, 'audio/ogg')}
         
-        stt_response = requests.post(f"{DIFY_URL}/audio/to-text", headers=headers, files=files)
-        stt_response.raise_for_status()
+        endpoint = f"{base_url}/audio/to-text"
+        print(f"Отправка аудио на расшифровку: {endpoint}")
+        
+        stt_response = requests.post(endpoint, headers=headers, files=files)
+        
+        if stt_response.status_code != 200:
+            print(f"Ошибка STT API. Код ответа: {stt_response.status_code}")
+            print(f"Тело ответа STT от Dify: {stt_response.text}")
+            stt_response.raise_for_status()
+            
         user_text = stt_response.json().get("text", "")
         
         if not user_text:
-            bot.reply_to(message, "Не удалось разобрать голос. Попробуй сказать четче.")
+            bot.reply_to(message, "Не удалось разобрать голос. Попробуй сказать/написать четче.")
             return
             
         answer = send_to_dify(user_text, message.from_user.id)
         bot.reply_to(message, answer)
         
     except Exception as e:
-        bot.reply_to(message, f"Ошибка при обработке голоса: {e}")
+        error_msg = f"Ошибка при обработке голоса: {e}"
+        if hasattr(e, 'response') and e.response is not None:
+            error_msg += f"\nДетали от Dify: {e.response.text}"
+        bot.reply_to(message, error_msg)
 
 if __name__ == "__main__":
     # Запускаем веб-заглушку в отдельном потоке, чтобы она не мешала боту
