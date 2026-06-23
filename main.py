@@ -5,8 +5,13 @@ import threading
 import json
 import time
 import io
+import logging
 from pydub import AudioSegment
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from flask import Flask, request
+
+# Отключаем спам-логи Flask, оставляем только критические ошибки
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
 
 TG_TOKEN = os.getenv("TGBOT_TOKEN")
 DIFY_KEY = os.getenv("DIFY_API_KEY")
@@ -16,6 +21,32 @@ ADMIN_TG_ID = os.getenv("ADMIN_TG_ID")
 bot = telebot.TeleBot(TG_TOKEN)
 user_conversations = {}
 
+app = Flask(__name__)
+
+# --- Облегченные роуты Flask ---
+@app.route('/')
+def home():
+    # Строгий микро-ответ. Flask сам закроет соединение правильно.
+    return "OK", 200
+
+@app.route('/webhook-reminder', methods=['POST'])
+def webhook_reminder():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        event_title = data.get("title", "Важная встреча")
+        
+        if ADMIN_TG_ID:
+            threading.Thread(
+                target=trigger_proactive_reminder, 
+                args=(event_title, int(ADMIN_TG_ID)), 
+                daemon=True
+            ).start()
+            
+        return "OK", 200
+    except Exception as e:
+        print(f"Ошибка POST вебхука: {e}")
+        return "Error", 500
+
 def trigger_proactive_reminder(event_title, user_id):
     try:
         system_query = f"Системный хук: Напомни мне в своем фирменном дружелюбном стиле (с эмодзи и скобочками), что через 5 минут начнется созвон/встреча: «{event_title}»."
@@ -23,53 +54,6 @@ def trigger_proactive_reminder(event_title, user_id):
         bot.send_message(user_id, victoria_style_answer)
     except Exception as e:
         print(f"Ошибка отправки напоминания: {e}")
-
-# --- Облегченный веб-сервер для хелсчеков и пингов ---
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        # Отдаем микроскопический ответ "OK", чтобы cron-job.org не выдавал ошибку "Output too large"
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK")
-        
-    def do_POST(self):
-        if self.path == '/webhook-reminder':
-            try:
-                content_length = int(self.headers['Content-Length'])
-                post_data = self.rfile.read(content_length)
-                data = json.loads(post_data.decode('utf-8'))
-                event_title = data.get("title", "Важная встреча")
-                
-                if ADMIN_TG_ID:
-                    threading.Thread(
-                        target=trigger_proactive_reminder, 
-                        args=(event_title, int(ADMIN_TG_ID)), 
-                        daemon=True
-                    ).start()
-                
-                self.send_response(200)
-                self.send_header("Content-type", "text/plain")
-                self.end_headers()
-                self.wfile.write(b"OK")
-            except Exception as e:
-                print(f"Ошибка POST: {e}")
-                self.send_response(500)
-                self.end_headers()
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, format, *args):
-        return  # Отключаем лишний спам в логах Render
-
-def run_health_check_server():
-    try:
-        port = int(os.getenv("PORT", 8080))
-        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-        server.serve_forever()
-    except Exception as e:
-        print(f"Ошибка хелсчека: {e}")
 
 # --- Работа с Dify (Стриминг + Память) ---
 def send_to_dify(text, user_id):
@@ -170,17 +154,21 @@ def handle_voice(message):
     except Exception as e:
         bot.reply_to(message, f"Ошибка голоса: {e}")
 
-# --- Точка входа с правильным разделением потоков ---
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, threaded=True)
+
+# --- Точка запуска ---
 if __name__ == "__main__":
-    # 1. Запускаем веб-сервер в ФОНОВОМ потоке, чтобы он не блокировал бота
-    flask_thread = threading.Thread(target=run_health_check_server)
+    # Запускаем стабильный Flask в фоне
+    flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
     
     try: bot.remove_webhook()
     except: pass
     
-    # 2. В основном потоке запускаем бессмертный цикл опроса Telegram
+    # Бессмертный цикл пуллинга в основном потоке
     while True:
         try:
             print("Бот успешно запущен и слушает Telegram...")
