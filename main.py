@@ -12,7 +12,7 @@ DIFY_URL = os.getenv("DIFY_API_URL", "https://api.dify.ai/v1")
 
 bot = telebot.TeleBot(TG_TOKEN)
 
-# --- Фоновый хелсчек для Render ---
+# --- Фоновый хелсчек для прохождения проверок портов Render ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -30,26 +30,8 @@ def run_health_check_server():
     except Exception as e:
         print(f"Ошибка хелсчека: {e}")
 
-# --- Загрузка файлов в Dify (для голосовых) ---
-def upload_file_to_dify(file_data, file_name, mime_type, user_id):
-    headers = {"Authorization": f"Bearer {DIFY_KEY.strip()}"}
-    base_url = DIFY_URL.strip()
-    
-    files = {'file': (file_name, file_data, mime_type)}
-    data = {'user': f"telegram_{user_id}"}
-    
-    endpoint = f"{base_url}/files/upload"
-    print(f"Загрузка файла в Dify: {endpoint}")
-    
-    resp = requests.post(endpoint, headers=headers, files=files, data=data)
-    if resp.status_code != 201 and resp.status_code != 200:
-        print(f"Ошибка загрузки файла в Dify: {resp.text}")
-        resp.raise_for_status()
-        
-    return resp.json().get("id")
-
-# --- Главная функция отправки запроса в Dify (Стриминг) ---
-def send_to_dify(text, user_id, dify_file_id=None, file_type=None):
+# --- Главная функция отправки текста Виктории (Streaming режим) ---
+def send_to_dify(text, user_id):
     headers = {
         "Authorization": f"Bearer {DIFY_KEY.strip()}",
         "Content-Type": "application/json"
@@ -58,25 +40,17 @@ def send_to_dify(text, user_id, dify_file_id=None, file_type=None):
     
     data = {
         "inputs": {},
-        "query": text if text else "Прослушай это аудио",
-        "response_mode": "streaming",  # Агенты поддерживают только streaming
+        "query": text,
+        "response_mode": "streaming",  # Агенты Dify работают только в streaming
         "conversation_id": "",
-        "user": f"telegram_{user_id}",
-        "files": []
+        "user": f"telegram_{user_id}"
     }
-    
-    if dify_file_id and file_type:
-        data["files"].append({
-            "type": file_type,
-            "transfer_method": "local_file",
-            "upload_file_id": dify_file_id
-        })
     
     endpoint = f"{base_url}/chat-messages"
     response = requests.post(endpoint, json=data, headers=headers, stream=True)
     
     if response.status_code not in [200, 201]:
-        print(f"Ошибка Dify API. Код: {response.status_code}, Текст: {response.text}")
+        print(f"Ошибка Dify Chat API. Код: {response.status_code}, Ответ: {response.text}")
         response.raise_for_status()
         
     full_answer = []
@@ -90,20 +64,20 @@ def send_to_dify(text, user_id, dify_file_id=None, file_type=None):
                     event_data = json.loads(json_str)
                     
                     if event_data.get("event") == "error":
-                        raise Exception(event_data.get("message", "Ошибка внутри стрима Dify"))
+                        raise Exception(event_data.get("message", "Ошибка стрима"))
                         
                     answer_chunk = event_data.get("answer", "")
                     if answer_chunk:
                         full_answer.append(answer_chunk)
                 except Exception as parse_err:
-                    print(f"Ворнинг при парсинге чанка: {parse_err}")
+                    print(f"Ошибка парсинга чанка: {parse_err}")
                     
-    return "".join(full_answer).strip() or "Виктория приняла запрос, но ответ оказался пустым."
+    return "".join(full_answer).strip() or "Виктория приняла запрос, но сформировала пустой ответ."
 
 # --- Обработчики Telegram ---
 @bot.message_handler(commands=['start'])
 def start_command(message):
-    bot.reply_to(message, "Привет! Я Виктория, твой личный ассистент. Я готова принимать как текстовые, так и голосовые сообщения!")
+    bot.reply_to(message, "Привет! Я Виктория, твой личный ассистент. Я готова принимать твои текстовые и голосовые команды!")
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
@@ -112,39 +86,64 @@ def handle_text(message):
         answer = send_to_dify(message.text, message.from_user.id)
         bot.reply_to(message, answer)
     except Exception as e:
-        bot.reply_to(message, f"Ошибка при ответе на текст: {e}")
+        bot.reply_to(message, f"Ошибка при обработке текста: {e}")
 
 @bot.message_handler(content_types=['voice'])
 def handle_voice(message):
     try:
         bot.send_chat_action(message.chat.id, 'typing')
         
-        # Скачиваем аудио из Телеграм
+        # Скачиваем голосовое сообщение из серверов Telegram
         file_info = bot.get_file(message.voice.file_id)
         file_url = f"https://api.telegram.org/file/bot{TG_TOKEN}/{file_info.file_path}"
         file_data = requests.get(file_url).content
         
-        # 1. Загружаем в Dify
-        dify_file_id = upload_file_to_dify(file_data, "voice.ogg", "audio/ogg", message.from_user.id)
+        headers = {"Authorization": f"Bearer {DIFY_KEY.strip()}"}
+        base_url = DIFY_URL.strip()
         
-        # 2. Передаем Агенту ссылку на файл
-        answer = send_to_dify("Прослушай голосовое сообщение и ответь на него.", message.from_user.id, dify_file_id=dify_file_id, file_type="audio")
+        # Передаем файл в multipart/form-data
+        files = {'file': ('voice.ogg', file_data, 'audio/ogg')}
+        data = {'user': f"telegram_{message.from_user.id}"}
+        
+        # ИСПРАВЛЕННЫЙ ЭНДПОИНТ (через дефис)
+        endpoint = f"{base_url}/audio-to-text"
+        print(f"Отправка аудио на расшифровку по адресу: {endpoint}")
+        
+        stt_response = requests.post(endpoint, headers=headers, files=files, data=data)
+        
+        if stt_response.status_code != 200:
+            print(f"Ошибка перевода в текст. Код: {stt_response.status_code}, Текст: {stt_response.text}")
+            stt_response.raise_for_status()
+            
+        # Забираем распознанный текст сообщения
+        user_text = stt_response.json().get("text", "")
+        print(f"Голос успешно распознан как: {user_text}")
+        
+        if not user_text:
+            bot.reply_to(message, "Я прослушала аудио, но не смогла разобрать ни одного слова. Попробуй сказать четче.")
+            return
+            
+        # Отправляем полученный текст Агенту Виктории
+        answer = send_to_dify(user_text, message.from_user.id)
         bot.reply_to(message, answer)
         
     except Exception as e:
-        bot.reply_to(message, f"Ошибка при обработке голоса: {e}")
+        error_msg = f"Ошибка при обработке голоса: {e}"
+        if hasattr(e, 'response') and e.response is not None:
+            error_msg += f"\n\nДетали от Dify: {e.response.text}"
+        bot.reply_to(message, error_msg)
 
 if __name__ == "__main__":
-    # Запуск хелсчека
+    # Фоновое простукивание портов для стабильности Render
     threading.Thread(target=run_health_check_server, daemon=True).start()
     
-    # Чистим вебхуки без параметров, чтобы старая версия старых библиотек не ломалась
+    # Базовый безопасный сброс вебхуков без капризных аргументов
     try:
-        print("Сброс старых подключений Telegram...")
+        print("Сброс старых сессий Telegram...")
         bot.remove_webhook()
         time.sleep(1)
     except Exception: 
         pass
     
-    print("Бот Виктория успешно запущен и слушает команды...")
+    print("Бот Виктория успешно запущен и ожидает сообщений...")
     bot.infinity_polling()
