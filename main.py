@@ -12,8 +12,7 @@ DIFY_URL = os.getenv("DIFY_API_URL", "https://api.dify.ai/v1")
 
 bot = telebot.TeleBot(TG_TOKEN)
 
-# Крошечная база данных в памяти сервера для хранения истории чатов
-# Она будет связывать Telegram ID пользователя с его уникальной комнатой в Dify
+# База данных в памяти для хранения истории чатов
 user_conversations = {}
 
 # --- Фоновый хелсчек для Render ---
@@ -22,7 +21,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Victoria is alive and remembers everything!")
+        self.wfile.write(b"Victoria is alive, awake, and remembers everything!")
     def log_message(self, format, *args):
         return
 
@@ -34,22 +33,20 @@ def run_health_check_server():
     except Exception as e:
         print(f"Ошибка хелсчека: {e}")
 
-# --- Главная функция отправки текста с поддержкой ПАМЯТИ ---
+# --- Функция отправки текста с поддержкой памяти ---
 def send_to_dify(text, user_id):
     headers = {
         "Authorization": f"Bearer {DIFY_KEY.strip()}",
         "Content-Type": "application/json"
     }
     base_url = DIFY_URL.strip()
-    
-    # Достаем сохраненный ID диалога для этого пользователя (если его нет, будет пустая строка)
     active_conversation_id = user_conversations.get(user_id, "")
     
     data = {
         "inputs": {},
         "query": text,
         "response_mode": "streaming",
-        "conversation_id": active_conversation_id,  # Передаем старый ID, чтобы продолжить диалог!
+        "conversation_id": active_conversation_id,
         "user": f"telegram_{user_id}"
     }
     
@@ -73,10 +70,8 @@ def send_to_dify(text, user_id):
                     if event_data.get("event") == "error":
                         raise Exception(event_data.get("message", "Ошибка стрима"))
                     
-                    # КРИТИЧЕСКИ ВАЖНО: Вытаскиваем ID беседы, который сгенерировал Dify
                     dify_conv_id = event_data.get("conversation_id")
                     if dify_conv_id and not active_conversation_id:
-                        # Записываем его в нашу базу данных, чтобы в следующий раз использовать его
                         user_conversations[user_id] = dify_conv_id
                         active_conversation_id = dify_conv_id
                         print(f"Создана новая сессия диалога для {user_id}: {dify_conv_id}")
@@ -92,7 +87,6 @@ def send_to_dify(text, user_id):
 # --- Обработчики Telegram ---
 @bot.message_handler(commands=['start'])
 def start_command(message):
-    # При команде /start стираем память конкретно этому пользователю, если нужно начать с чистого листа
     if message.from_user.id in user_conversations:
         del user_conversations[message.from_user.id]
     bot.reply_to(message, "Привет! Я Виктория. Моя память обновлена, теперь я буду помнить всё, о чём мы говорим в рамках нашей беседы!")
@@ -115,7 +109,6 @@ def handle_voice(message):
         file_url = f"https://api.telegram.org/file/bot{TG_TOKEN}/{file_info.file_path}"
         ogg_data = requests.get(file_url).content
         
-        # На лету конвертируем звук, как в прошлый раз
         import io
         from pydub import AudioSegment
         ogg_stream = io.BytesIO(ogg_data)
@@ -141,17 +134,28 @@ def handle_voice(message):
             bot.reply_to(message, "Не удалось расслышать слова.")
             return
             
-        # Отправляем текст в нашу обновленную функцию с памятью
         answer = send_to_dify(user_text, message.from_user.id)
         bot.reply_to(message, answer)
         
     except Exception as e:
         bot.reply_to(message, f"Ошибка голоса: {e}")
 
+# --- Точка входа с защитой от падений ---
 if __name__ == "__main__":
+    # Запускаем веб-сервер хелсчека в фоне
     threading.Thread(target=run_health_check_server, daemon=True).start()
+    
     try: bot.remove_webhook()
     except: pass
     
-    print("Бот Виктория запущен в режиме глубокой памяти...")
-    bot.infinity_polling()
+    print("Бот Виктория запущен с двойной защитой от зависаний...")
+    
+    # Бесконечный цикл автоматического перезапуска
+    while True:
+        try:
+            # timeout=20 и long_polling_timeout=10 не дают соединению уйти в "зомби-режим"
+            bot.infinity_polling(timeout=20, long_polling_timeout=10)
+        except Exception as crash_error:
+            print(f"Критический сбой пуллинга: {crash_error}")
+            print("Перезапуск соединения через 5 секунд...")
+            time.sleep(5)
