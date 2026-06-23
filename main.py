@@ -2,6 +2,8 @@ import os
 import telebot
 import requests
 import threading
+import json
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 TG_TOKEN = os.getenv("TGBOT_TOKEN")
@@ -22,40 +24,78 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         return  # Отключаем лишние логи в консоли Render
 
 def run_health_check_server():
-    port = int(os.getenv("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    print(f"Фоновый хелсчек-сервер запущен на порту {port}")
-    server.serve_forever()
-# --------------------------------------------------------
+    try:
+        port = int(os.getenv("PORT", 8080))
+        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        print(f"Фоновый хелсчек-сервер успешно запущен на порту {port}")
+        server.serve_forever()
+    except Exception as e:
+        print(f"Ошибка при запуске фонового хелсчек-сервера: {e}")
 
+# --- Работа с API Dify в режиме стриминга ---
 def send_to_dify(text, user_id):
     headers = {
-        "Authorization": f"Bearer {DIFY_KEY}",
+        "Authorization": f"Bearer {DIFY_KEY.strip()}",
         "Content-Type": "application/json"
     }
-    # Очищаем URL от возможных случайных пробелов
     base_url = DIFY_URL.strip()
     
+    # Формируем JSON-запрос со строго указанным streaming режимом
     data = {
         "inputs": {},
         "query": text,
-        "response_mode": "blocking",
-        "user": f"tg_{user_id}"
+        "response_mode": "streaming",  # Агенты Dify поддерживают только этот режим
+        "conversation_id": "",
+        "user": f"telegram_{user_id}"
     }
     
     endpoint = f"{base_url}/chat-messages"
     print(f"Отправка запроса на: {endpoint}")
     
-    response = requests.post(endpoint, json=data, headers=headers)
+    # Указываем stream=True для обработки потока данных
+    response = requests.post(endpoint, json=data, headers=headers, stream=True)
     
-    # Если Dify ответил ошибкой, выводим её подробное описание в логи Render
-    if response.status_code != 200:
+    if response.status_code != 200 and response.status_code != 201:
         print(f"Ошибка Dify API. Код ответа: {response.status_code}")
         print(f"Тело ответа от Dify: {response.text}")
         response.raise_for_status()
         
-    return response.json().get("answer", "Извини, не удалось получить ответ от Виктории.")
+    full_answer = []
+    
+    # Построчно считываем поток Server-Sent Events (SSE) от Dify
+    for line in response.iter_lines():
+        if line:
+            decoded_line = line.decode('utf-8').strip()
+            # Проверяем, что строка содержит данные события
+            if decoded_line.startswith("data:"):
+                try:
+                    # Отрезаем префикс "data: " и парсим JSON
+                    json_str = decoded_line[5:].strip()
+                    if not json_str:
+                        continue
+                        
+                    event_data = json.loads(json_str)
+                    
+                    # Ловим сообщения об ошибках внутри стрима
+                    if event_data.get("event") == "error":
+                        error_msg = event_data.get("message", "Неизвестная ошибка внутри стрима")
+                        raise Exception(f"Dify Stream Error: {error_msg}")
+                    
+                    # Собираем текстовые кусочки ответа (answer)
+                    answer_chunk = event_data.get("answer", "")
+                    if answer_chunk:
+                        full_answer.append(answer_chunk)
+                        
+                except Exception as parse_err:
+                    print(f"Предупреждение при чтении чанка стрима: {parse_err}")
+                    
+    final_text = "".join(full_answer).strip()
+    if not final_text:
+        return "Извини, Виктория задумалась и не смогла сформулировать ответ. Попробуй еще раз."
+        
+    return final_text
 
+# --- Обработчики Telegram ---
 @bot.message_handler(commands=['start'])
 def start_command(message):
     bot.reply_to(message, "Привет! Я Виктория, твой личный ассистент. Готова к работе! Напиши мне или наговори голосовое сообщение.")
@@ -67,10 +107,13 @@ def handle_text(message):
         answer = send_to_dify(message.text, message.from_user.id)
         bot.reply_to(message, answer)
     except Exception as e:
-        # Пытаемся вытащить подробности ошибки из исключения HTTPError
         error_msg = f"Произошла ошибка: {e}"
         if hasattr(e, 'response') and e.response is not None:
-            error_msg += f"\nДетали от Dify: {e.response.text}"
+            try:
+                err_json = e.response.json()
+                error_msg += f"\n\nКод ошибки: {err_json.get('code')}\nОписание: {err_json.get('message')}"
+            except Exception:
+                error_msg += f"\n\nДетали: {e.response.text}"
         bot.reply_to(message, error_msg)
 
 @bot.message_handler(content_types=['voice'])
@@ -83,7 +126,7 @@ def handle_voice(message):
         
         file_data = requests.get(file_url).content
         
-        headers = {"Authorization": f"Bearer {DIFY_KEY}"}
+        headers = {"Authorization": f"Bearer {DIFY_KEY.strip()}"}
         base_url = DIFY_URL.strip()
         files = {'file': ('voice.ogg', file_data, 'audio/ogg')}
         
@@ -109,12 +152,25 @@ def handle_voice(message):
     except Exception as e:
         error_msg = f"Ошибка при обработке голоса: {e}"
         if hasattr(e, 'response') and e.response is not None:
-            error_msg += f"\nДетали от Dify: {e.response.text}"
+            try:
+                err_json = e.response.json()
+                error_msg += f"\n\nКод ошибки: {err_json.get('code')}\nОписание: {err_json.get('message')}"
+            except Exception:
+                error_msg += f"\n\nДетали: {e.response.text}"
         bot.reply_to(message, error_msg)
 
 if __name__ == "__main__":
-    # Запускаем веб-заглушку в отдельном потоке, чтобы она не мешала боту
+    # Запускаем веб-заглушку в отдельном потоке, защищенном от падений
     threading.Thread(target=run_health_check_server, daemon=True).start()
     
+    # Перед запуском опроса сбрасываем старые вебхуки и удаляем зависшие в очереди сообщения
+    try:
+        print("Сброс старых подключений Telegram...")
+        bot.remove_webhook(drop_pending_updates=True)
+        time.sleep(1)
+    except Exception as ex:
+        print(f"Предупреждение при сбросе вебхука: {ex}")
+    
     print("Бот успешно запущен и слушает команды...")
-    bot.infinity_polling()
+    # Запускаем бесконечный опрос с автоматическим пропуском старых обновлений
+    bot.infinity_polling(skip_pending_updates=True)
