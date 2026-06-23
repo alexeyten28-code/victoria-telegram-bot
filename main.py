@@ -156,4 +156,4 @@ if __name__ == "__main__":
         pass
     
     print("Бот Виктория успешно запущен и ожидает сообщений...")
-    bot.infinity_polling()
+    bot.infinity_polling(timeout=20, long_polling_timeout=10)
