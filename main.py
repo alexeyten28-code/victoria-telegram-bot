@@ -40,7 +40,6 @@ def send_to_dify(text, user_id):
     }
     base_url = DIFY_URL.strip()
     
-    # Формируем JSON-запрос со строго указанным streaming режимом
     data = {
         "inputs": {},
         "query": text,
@@ -52,7 +51,6 @@ def send_to_dify(text, user_id):
     endpoint = f"{base_url}/chat-messages"
     print(f"Отправка запроса на: {endpoint}")
     
-    # Указываем stream=True для обработки потока данных
     response = requests.post(endpoint, json=data, headers=headers, stream=True)
     
     if response.status_code != 200 and response.status_code != 201:
@@ -62,26 +60,21 @@ def send_to_dify(text, user_id):
         
     full_answer = []
     
-    # Построчно считываем поток Server-Sent Events (SSE) от Dify
     for line in response.iter_lines():
         if line:
             decoded_line = line.decode('utf-8').strip()
-            # Проверяем, что строка содержит данные события
             if decoded_line.startswith("data:"):
                 try:
-                    # Отрезаем префикс "data: " и парсим JSON
                     json_str = decoded_line[5:].strip()
                     if not json_str:
                         continue
                         
                     event_data = json.loads(json_str)
                     
-                    # Ловим сообщения об ошибках внутри стрима
                     if event_data.get("event") == "error":
                         error_msg = event_data.get("message", "Неизвестная ошибка внутри стрима")
                         raise Exception(f"Dify Stream Error: {error_msg}")
                     
-                    # Собираем текстовые кусочки ответа (answer)
                     answer_chunk = event_data.get("answer", "")
                     if answer_chunk:
                         full_answer.append(answer_chunk)
@@ -160,10 +153,9 @@ def handle_voice(message):
         bot.reply_to(message, error_msg)
 
 if __name__ == "__main__":
-    # Запускаем веб-заглушку в отдельном потоке, защищенном от падений
+    # Запускаем веб-заглушку в отдельном потоке
     threading.Thread(target=run_health_check_server, daemon=True).start()
     
-    # Перед запуском опроса сбрасываем старые вебхуки и удаляем зависшие в очереди сообщения
     try:
         print("Сброс старых подключений Telegram...")
         bot.remove_webhook(drop_pending_updates=True)
@@ -171,6 +163,8 @@ if __name__ == "__main__":
     except Exception as ex:
         print(f"Предупреждение при сбросе вебхука: {ex}")
     
+    # Включаем пропуск старых обновлений через свойство класса (совместимо со всеми версиями)
+    bot.skip_pending_updates = True
+    
     print("Бот успешно запущен и слушает команды...")
-    # Запускаем бесконечный опрос с автоматическим пропуском старых обновлений
-    bot.infinity_polling(skip_pending_updates=True)
+    bot.infinity_polling()
