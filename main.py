@@ -4,6 +4,8 @@ import requests
 import threading
 import json
 import time
+import io
+from pydub import AudioSegment
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 TG_TOKEN = os.getenv("TGBOT_TOKEN")
@@ -77,7 +79,7 @@ def send_to_dify(text, user_id):
 # --- Обработчики Telegram ---
 @bot.message_handler(commands=['start'])
 def start_command(message):
-    bot.reply_to(message, "Привет! Я Виктория, твой личный ассистент. Я готова принимать твои текстовые и голосовые команды!")
+    bot.reply_to(message, "Привет! Я Виктория, твой личный ассистент. Теперь я полноценно понимаю и текст, и голосовые сообщения!")
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
@@ -93,21 +95,29 @@ def handle_voice(message):
     try:
         bot.send_chat_action(message.chat.id, 'typing')
         
-        # Скачиваем голосовое сообщение из серверов Telegram
+        # 1. Скачиваем голосовое сообщение (.ogg) из серверов Telegram
         file_info = bot.get_file(message.voice.file_id)
         file_url = f"https://api.telegram.org/file/bot{TG_TOKEN}/{file_info.file_path}"
-        file_data = requests.get(file_url).content
+        ogg_data = requests.get(file_url).content
+        
+        print("Конвертируем Telegram OGG в совместимый WAV формат...")
+        # 2. На лету с помощью pydub пересобираем аудио в чистый WAV, который Dify обожает
+        ogg_stream = io.BytesIO(ogg_data)
+        audio = AudioSegment.from_file(ogg_stream, format="ogg")
+        
+        wav_stream = io.BytesIO()
+        audio.export(wav_stream, format="wav")
+        wav_data = wav_stream.getvalue()
         
         headers = {"Authorization": f"Bearer {DIFY_KEY.strip()}"}
         base_url = DIFY_URL.strip()
         
-        # Передаем файл в multipart/form-data
-        files = {'file': ('voice.ogg', file_data, 'audio/ogg')}
+        # Передаем уже сконвертированный WAV файл в multipart/form-data
+        files = {'file': ('voice.wav', wav_data, 'audio/wav')}
         data = {'user': f"telegram_{message.from_user.id}"}
         
-        # ИСПРАВЛЕННЫЙ ЭНДПОИНТ (через дефис)
         endpoint = f"{base_url}/audio-to-text"
-        print(f"Отправка аудио на расшифровку по адресу: {endpoint}")
+        print(f"Отправка WAV аудио на расшифровку по адресу: {endpoint}")
         
         stt_response = requests.post(endpoint, headers=headers, files=files, data=data)
         
@@ -120,7 +130,7 @@ def handle_voice(message):
         print(f"Голос успешно распознан как: {user_text}")
         
         if not user_text:
-            bot.reply_to(message, "Я прослушала аудио, но не смогла разобрать ни одного слова. Попробуй сказать четче.")
+            bot.reply_to(message, "Я прослушала аудио, но не смогла расслышать слова. Попробуй сказать четче.")
             return
             
         # Отправляем полученный текст Агенту Виктории
@@ -137,7 +147,7 @@ if __name__ == "__main__":
     # Фоновое простукивание портов для стабильности Render
     threading.Thread(target=run_health_check_server, daemon=True).start()
     
-    # Базовый безопасный сброс вебхуков без капризных аргументов
+    # Базовый безопасный сброс вебхуков
     try:
         print("Сброс старых сессий Telegram...")
         bot.remove_webhook()
